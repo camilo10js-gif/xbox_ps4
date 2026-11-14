@@ -1,4 +1,4 @@
-// xbox_pad.cpp v2 - Xbox One/Series (GIP) por USB -> pad PS4
+// xbox_pad.cpp v2.1 - Xbox One/Series (GIP) por USB -> pad PS4
 // Log en /data/xbox_pad.log. Sin probar en consola real.
 
 #include <stdint.h>
@@ -20,7 +20,7 @@
 attr_public const char *g_pluginName = "xbox_pad";
 attr_public const char *g_pluginDesc = "Xbox One/Series USB controller -> PS4 pad";
 attr_public const char *g_pluginAuth = "community";
-attr_public uint32_t g_pluginVersion = 0x00000200;
+attr_public uint32_t g_pluginVersion = 0x00000201;
 
 // Funciones del SDK/sistema con alias propio (evita choques con cabeceras)
 extern "C" int xp_jailbreak(void *) __asm__("sys_sdk_jailbreak");
@@ -81,9 +81,10 @@ struct PadState {
 };
 static PadState g_pad = {0, 0x80, 0x80, 0x80, 0x80, 0, 0, 0};
 
-// ---------------- libSceUsbd (API tipo libusb-1.0) ----------------
+// ---------------- libSceUsbd ----------------
+// OJO: en la PS4 sceUsbdGetDeviceList recibe UN solo parametro (la lista).
 typedef int (*fn_init)(void **ctx);
-typedef int (*fn_list)(void *ctx, void ***list);
+typedef int (*fn_list)(void ***list);
 typedef void (*fn_freelist)(void **list, int unref);
 typedef int (*fn_getdesc)(void *dev, uint8_t *desc);
 typedef int (*fn_open)(void *dev, void **handle);
@@ -196,8 +197,11 @@ static void note_device(uint16_t vid, uint16_t pid) {
 }
 
 static bool find_and_open(void *ctx, void **hOut, int *iface, uint8_t *inEp, uint8_t *outEp) {
+    (void)ctx;
     void **list = 0;
-    int cnt = p_list(ctx, &list);
+    int cnt = p_list(&list);
+    static int s_lastcnt = -999;
+    if (cnt != s_lastcnt) { s_lastcnt = cnt; logf_("GetDeviceList = %d", cnt); }
     if (cnt <= 0 || !list) return false;
 
     void *found = 0;
@@ -395,7 +399,7 @@ static void *hook_thread(void *) {
 extern "C" {
 
 attr_module_hidden int module_start(size_t argc, const void *args) {
-    logf_("xbox_pad v2 cargado");
+    logf_("xbox_pad v2.1 cargado");
     OrbisPthread t1, t2;
     scePthreadCreate(&t1, 0, hook_thread, 0, "xbox_hook");
     scePthreadCreate(&t2, 0, usb_thread, 0, "xbox_usb");
