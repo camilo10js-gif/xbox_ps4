@@ -15,12 +15,8 @@ jobs:
 
       - name: OpenOrbis
         run: |
-          URL=$(curl -s https://api.github.com/repos/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/latest | jq -r '.assets[].browser_download_url' | grep -i linux | head -n1)
-          echo "URL: $URL"
-          curl -L "$URL" -o oo.tar.gz
-          mkdir -p oo && tar -xzf oo.tar.gz -C oo
-          ls oo
-          echo "OO_PS4_TOOLCHAIN=$(find $PWD/oo -maxdepth 2 -type d -name PS4Toolchain | head -n1)" >> $GITHUB_ENV
+          git clone --depth 1 https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain.git oo
+          echo "OO_PS4_TOOLCHAIN=$PWD/oo" >> $GITHUB_ENV
 
       - name: SDK GoldHEN
         run: |
