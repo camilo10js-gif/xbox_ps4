@@ -1,0 +1,52 @@
+name: Build xbox_pad
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dependencias
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang lld git make cmake jq curl
+
+      - name: OpenOrbis
+        run: |
+          URL=$(curl -s https://api.github.com/repos/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/latest | jq -r '.assets[].browser_download_url' | grep -i linux | head -n1)
+          echo "URL: $URL"
+          curl -L "$URL" -o oo.tar.gz
+          mkdir -p oo && tar -xzf oo.tar.gz -C oo
+          ls oo
+          echo "OO_PS4_TOOLCHAIN=$(find $PWD/oo -maxdepth 2 -type d -name PS4Toolchain | head -n1)" >> $GITHUB_ENV
+
+      - name: SDK GoldHEN
+        run: |
+          git clone --depth 1 https://github.com/GoldHEN/GoldHEN_Plugins_SDK sdk
+          find sdk -maxdepth 3 | head -80
+
+      - name: Compilar
+        run: |
+          D=$(find sdk -type f -name Makefile | grep -iE 'sample|example|template' | head -n1 | xargs dirname)
+          echo "Carpeta del ejemplo: $D"
+          cp xbox_pad.cpp "$D"/
+          cd "$D"
+          ls
+          export GOLDHEN_SDK=$GITHUB_WORKSPACE/sdk
+          make
+
+      - name: Recoger resultado
+        if: always()
+        run: |
+          mkdir -p out
+          find sdk -name '*.prx' -exec cp {} out/ \;
+          ls out
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xbox_pad
+          path: out/
+          if-no-files-found: warn
