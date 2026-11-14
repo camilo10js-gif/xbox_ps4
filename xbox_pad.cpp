@@ -1,5 +1,5 @@
-// xbox_pad.cpp v2.10 diagnostico - Xbox One/Series (GIP) por USB -> pad PS4
-// Log en /data/xbox_pad.log + avisos en pantalla. Sin probar en consola real.
+// xbox_pad.cpp v2.11 diagnostico - Xbox One/Series (GIP) por USB -> pad PS4
+// Log en /data/xbox_pad.log + avisos en pantalla. Base 2.10 probada por el usuario en Dead Cells; 2.11 pendiente de prueba fisica.
 
 #include <stdint.h>
 #include <string.h>
@@ -12,6 +12,7 @@
 #include <GoldHEN.h>
 #include <Detour.h>
 #include <HDE64.h>
+#include "shared/config.h"
 
 #ifndef attr_public
 #define attr_public __attribute__((visibility("default")))
@@ -23,7 +24,7 @@
 attr_public const char *g_pluginName = "xbox_pad";
 attr_public const char *g_pluginDesc = "Xbox One/Series USB controller -> PS4 pad";
 attr_public const char *g_pluginAuth = "community";
-attr_public uint32_t g_pluginVersion = 0x00000210;
+attr_public uint32_t g_pluginVersion = 0x00000211;
 
 // Funciones del SDK/sistema con alias propio (evita choques con cabeceras)
 extern "C" int xp_jailbreak(void *) __asm__("sys_sdk_jailbreak");
@@ -56,8 +57,7 @@ static const uint16_t kPids[] = {0x0B12, 0x0B00, 0x02EA, 0x02DD, 0x02D1, 0x02E3}
 // ---------------- Log ----------------
 static int g_loglines = 0;
 static void logf_(const char *fmt, ...) {
-    if (g_loglines > 1200) return;
-    g_loglines++;
+    if (__atomic_fetch_add(&g_loglines, 1, __ATOMIC_RELAXED) >= 1200) return;
     char b[256];
     va_list ap;
     va_start(ap, fmt);
@@ -122,6 +122,21 @@ static int g_last_handle = 0, g_last_result = 0, g_last_count = 0, g_last_connec
 // Resolver el pad dentro del sandbox antes de que jailbreak cambie las rutas.
 static int g_pad_discovery_done = 0;
 
+static xp::Config g_config = xp::defaultsConfig();
+static char g_title[10];
+static xp::State g_mapped = {};
+static int g_ready = 0;
+static int g_diagnostic = 0;
+static unsigned g_state_lock = 0;
+static void state_lock() { while (__atomic_exchange_n(&g_state_lock,1,__ATOMIC_ACQUIRE)) sceKernelUsleep(50); }
+static void state_unlock() { __atomic_store_n(&g_state_lock,0,__ATOMIC_RELEASE); }
+static void publish_state() {
+    xp::State raw = {g_pad.buttons,{g_pad.lx,g_pad.ly,g_pad.rx,g_pad.ry},{g_pad.l2,g_pad.r2}};
+    xp::State mapped=xp::map(raw,xp::selected(g_config,g_title));
+    state_lock(); g_mapped=mapped; g_ready=g_pad.connected; state_unlock();
+}
+static void reload_config() { static uint64_t last=0; uint64_t now=xp_ptime(); if(now-last<1000000)return;last=now;xp::Config c;if(xp::load(xp::path,c)){g_config=c;__atomic_store_n(&g_diagnostic,c.diagnostic,__ATOMIC_RELAXED);}publish_state(); }
+
 // ---------------- libSceUsbd ----------------
 // OJO: en la PS4 sceUsbdGetDeviceList recibe UN solo parametro (la lista).
 typedef int (*fn_init)(void **ctx);
@@ -179,13 +194,15 @@ static uint8_t invaxis16(int16_t v) { return (uint8_t)(255 - (((int)v + 32768) >
 static uint32_t s_main = 0, s_guide = 0;
 
 static void parse_gip(const uint8_t *p, int n) {
-    if (n >= 5 && p[0] == 0x07) {  // boton Xbox (guia) -> PS
+    if (n >= 6 && p[0] == 0x07 && p[3] == 2) {  // boton Xbox (guia) -> PS
         s_guide = (p[4] & 1) ? PS4_PS : 0;
         g_pad.buttons = s_main | s_guide;
         return;
     }
-    if (n < 18 || p[0] != 0x20) return;  // 0x20 = informe de entrada
+    if (n < 18 || p[0] != 0x20 || (p[1] & 0xC0) || p[3] < 14 || p[3] + 4 > n) return;  // 0x20 = informe de entrada
 
+    if (!g_pad.connected) notify("Mando Xbox recibiendo entradas");
+    g_pad.connected = 1;
     uint8_t b0 = p[4], b1 = p[5];
     uint32_t o = 0;
     if (b0 & 0x04) o |= PS4_OPTIONS;   // Menu
@@ -205,7 +222,7 @@ static void parse_gip(const uint8_t *p, int n) {
 
     uint16_t lt = (uint16_t)(p[6] | (p[7] << 8));  // 0..1023
     uint16_t rt = (uint16_t)(p[8] | (p[9] << 8));
-    uint8_t l2 = (uint8_t)(lt >> 2), r2 = (uint8_t)(rt >> 2);
+    uint8_t l2 = (uint8_t)((lt > 1023 ? 1023 : lt) >> 2), r2 = (uint8_t)((rt > 1023 ? 1023 : rt) >> 2);
     if (l2 > 30) o |= PS4_L2;
     if (r2 > 30) o |= PS4_R2;
 
@@ -224,7 +241,7 @@ static void parse_gip(const uint8_t *p, int n) {
     g_pad.buttons = o | s_guide;
     static uint32_t last_buttons = 0;
     static unsigned button_logs = 0;
-    if (g_pad.buttons != last_buttons && button_logs < 80) {
+    if (g_config.diagnostic && g_pad.buttons != last_buttons && button_logs < 80) {
         last_buttons = g_pad.buttons;
         ++button_logs;
         logf_("pid=%d botones Xbox=%02X/%02X PS4=0x%08X", (int)getpid(), b0, b1, (unsigned)last_buttons);
@@ -278,19 +295,21 @@ static bool find_and_open(void *ctx, void **hOut, int *iface, uint8_t *inEp, uin
     if (!ok) return false;
 
     // Descriptor de configuracion: buscar interfaz FF/47/D0 y sus endpoints
-    *iface = 0; *inEp = 0x82; *outEp = 0x02;  // valores vistos en tu mando
+    *iface = 0; *inEp = 0; *outEp = 0;  // valores vistos en tu mando
     uint8_t cfg[256];
     memset(cfg, 0, sizeof(cfg));
     int len = p_ctrl(h, 0x80, 6, 0x0200, 0, cfg, 255, 1000);
     logf_("config descriptor: %d bytes", len);
-    if (len > 9) {
+    if (len > 9 && len <= 255) {
         uint8_t fi = 0xFF, fin = 0, fout = 0;
         bool match = false;
         int off = 0;
         while (off + 2 <= len) {
             uint8_t dl = cfg[off], dt = cfg[off + 1];
-            if (dl < 2) break;
+            if (dl < 2 || off + dl > len) break;
             if (dt == 4 && dl >= 9) {
+                if (fi != 0xFF && fin && fout) break;
+                fin = fout = 0; fi = 0xFF;
                 match = (cfg[off + 3] == 0 && cfg[off + 5] == 0xFF && cfg[off + 6] == 0x47 && cfg[off + 7] == 0xD0);
                 if (match && fi == 0xFF) fi = cfg[off + 2];
             } else if (dt == 5 && match && dl >= 7 && (cfg[off + 3] & 3) == 3) {
@@ -302,6 +321,7 @@ static bool find_and_open(void *ctx, void **hOut, int *iface, uint8_t *inEp, uin
         if (fi != 0xFF && fin && fout) { *iface = fi; *inEp = fin; *outEp = fout; }
         logf_("GIP: iface=%d IN=0x%02X OUT=0x%02X", *iface, *inEp, *outEp);
     }
+    if (!*inEp || !*outEp) { p_close(h); return false; }
     *hOut = h;
     return true;
 }
@@ -315,14 +335,14 @@ static bool send_gip(void *h, uint8_t ep, const char *name, const uint8_t *packe
     return r == 0 && done == len;
 }
 
-static void send_initialization(void *h, uint8_t ep) {
+static bool send_initialization(void *h, uint8_t ep) {
     // Secuencia generica de xpad para mandos Xbox One y Series por USB.
     static const uint8_t power[] = {0x05, 0x20, 0x00, 0x01, 0x00};
     static const uint8_t led[] = {0x0A, 0x20, 0x00, 0x03, 0x00, 0x01, 0x14};
     static const uint8_t auth[] = {0x06, 0x20, 0x00, 0x02, 0x01, 0x00};
-    send_gip(h, ep, "power-on", power, sizeof(power));
-    send_gip(h, ep, "led-on", led, sizeof(led));
-    send_gip(h, ep, "auth-done", auth, sizeof(auth));
+    bool ok = send_gip(h, ep, "power-on", power, sizeof(power));
+    ok = send_gip(h, ep, "led-on", led, sizeof(led)) && ok;
+    return send_gip(h, ep, "auth-done", auth, sizeof(auth)) && ok;
 }
 
 // ---------------- Hilo USB ----------------
@@ -337,8 +357,10 @@ static void *usb_thread(void *) {
     int ir = p_init(&ctx);
     logf_("sceUsbdInit = 0x%08X", (unsigned)ir);
 
+    if(ir != 0 || jr != 0) return 0;
     int scans = 0;
     for (;;) {
+        reload_config();
         void *h = 0;
         int iface = 0;
         uint8_t inEp = 0, outEp = 0;
@@ -362,8 +384,8 @@ static void *usb_thread(void *) {
         }
 
         g_seq = 0;
-        send_initialization(h, outEp);
-        g_pad.connected = 1;
+        if (!send_initialization(h, outEp)) { if(p_release)p_release(h,iface);p_close(h);sceKernelSleep(1);continue; }
+        g_pad.connected = 0;
         notify("USB Xbox detectado (xbox_pad)");
 
         int errs = 0, npk = 0, poweron_extra = 0, resends = 0;
@@ -374,7 +396,8 @@ static void *usb_thread(void *) {
 
         for (;;) {
             int done = 0;
-            bool dbg = nreads < 25;
+            reload_config();
+            bool dbg = g_config.diagnostic && nreads < 25;
             if (dbg) logf_("leyendo #%d ...", nreads);
             uint64_t t0 = xp_ptime();
             int r = p_int(h, inEp, g_rx, 64, &done, 100);
@@ -382,17 +405,22 @@ static void *usb_thread(void *) {
             if (dbg) logf_("   r=0x%08X done=%d tardo=%u ms", (unsigned)r, done, (unsigned)((t1 - t0) / 1000));
             nreads++;
 
-            if (r == 0 && done > 0) {
+            if (r == 0 && done > 0 && done <= 64) {
                 errs = 0;
                 fast_timeouts = 0;
-                if (rx_logs < 40 && (npk < 12 || g_rx[0] != lastcmd)) { log_hex("rx", g_rx, done); ++rx_logs; }
+                if (g_config.diagnostic && rx_logs < 40 && (npk < 12 || g_rx[0] != lastcmd)) { log_hex("rx", g_rx, done); ++rx_logs; }
                 npk++;
                 lastcmd = g_rx[0];
                 if (g_rx[0] == 0x02 && poweron_extra < 3) {  // anuncio: repetir encendido
                     poweron_extra++;
                     send_initialization(h, outEp);
                 }
-                parse_gip(g_rx, done);
+                if(done>=6 && g_rx[0]==7 && g_rx[1]==0x30 && g_rx[3]==2) {
+                    uint8_t ack[]={1,0x20,g_rx[2],9,0,7,0x20,2,0,0,0,0,0};
+                    int sent=0; int ar=p_int(h,outEp,ack,sizeof(ack),&sent,1000);
+                    if(ar || sent!=(int)sizeof(ack)) logf_("ACK guia fallo r=%08X enviados=%d",ar,sent);
+                }
+                parse_gip(g_rx, done); publish_state();
             } else if (is_timeout(r)) {
                 errs = 0;
                 ntimeouts++;
@@ -414,13 +442,14 @@ static void *usb_thread(void *) {
             }
 
             // Reenviar la secuencia cada 2 s mientras no llegue ningun paquete
-            if (npk == 0 && resends < 6 && (t1 - t_poweron) > 2000000ULL) {
+            if (!g_pad.connected && resends < 6 && (t1 - t_poweron) > 2000000ULL) {
                 t_poweron = t1;
                 resends++;
                 logf_("sin paquetes aun: reenvio inicializacion (%d)", resends);
                 send_initialization(h, outEp);
             }
 
+            if (!g_pad.connected && t1-t_start>15000000ULL) break;
             // Resumen cada 5 s
             if ((t1 - t_status) > 5000000ULL) {
                 t_status = t1;
@@ -433,6 +462,7 @@ static void *usb_thread(void *) {
         notify("Mando Xbox desconectado (xbox_pad)");
         g_pad.connected = 0;
         g_pad.buttons = 0;
+        g_pad.lx=g_pad.ly=g_pad.rx=g_pad.ry=128;g_pad.l2=g_pad.r2=0;publish_state();
         s_main = s_guide = 0;
         if (p_release) p_release(h, iface);
         p_close(h);
@@ -639,47 +669,21 @@ static void log_pad_modules() {
     }
 }
 
-static void inject(uint8_t *d, bool fresh) {
-    if (fresh) {
-        memset(d, 0, sizeof(OrbisPadData));
-        d[4] = d[5] = d[6] = d[7] = 0x80;
-        *(float *)(d + 24) = 1.0f;
-    }
-    *(uint32_t *)(d + 0) |= g_pad.buttons;
-    if (fresh || g_pad.lx < 0x70 || g_pad.lx > 0x90) d[4] = g_pad.lx;
-    if (fresh || g_pad.ly < 0x70 || g_pad.ly > 0x90) d[5] = g_pad.ly;
-    if (fresh || g_pad.rx < 0x70 || g_pad.rx > 0x90) d[6] = g_pad.rx;
-    if (fresh || g_pad.ry < 0x70 || g_pad.ry > 0x90) d[7] = g_pad.ry;
-    if (g_pad.l2 > d[8]) d[8] = g_pad.l2;
-    if (g_pad.r2 > d[9]) d[9] = g_pad.r2;
-    d[76] = 1;
+static void inject(uint8_t *d, const xp::State &s) {
+    uint32_t buttons; memcpy(&buttons,d,4); buttons |= s.buttons; memcpy(d,&buttons,4);
+    for(int i=0;i<4;i++) if(s.axis[i]!=128) d[4+i]=s.axis[i];
+    for(int i=0;i<2;i++) if(s.trigger[i]>d[8+i])d[8+i]=s.trigger[i];
 }
-
 static int post_ReadState(int32_t h, void *data, int r) {
-    __atomic_fetch_add(&g_readstate_calls, 1u, __ATOMIC_RELAXED);
-    __atomic_store_n(&g_last_handle, h, __ATOMIC_RELAXED);
-    __atomic_store_n(&g_last_result, r, __ATOMIC_RELAXED);
-    __atomic_store_n(&g_last_count, 1, __ATOMIC_RELAXED);
-    __atomic_store_n(&g_last_connected, (r == 0 && data) ? ((uint8_t *)data)[76] : -1, __ATOMIC_RELAXED);
-    if (g_pad.connected && data) { inject((uint8_t *)data, r != 0); __atomic_fetch_add(&g_inject_calls, 1u, __ATOMIC_RELAXED); return 0; }
+    __atomic_fetch_add(&g_readstate_calls,1u,__ATOMIC_RELAXED);
+    state_lock(); xp::State s=g_mapped; bool ready=g_ready;state_unlock();
+    if(ready && r==0 && data && ((uint8_t*)data)[76]) { inject((uint8_t*)data,s);__atomic_fetch_add(&g_inject_calls,1u,__ATOMIC_RELAXED); }
     return r;
 }
-
 static int post_Read(int32_t h, void *data, int32_t count, int r) {
-    __atomic_fetch_add(&g_read_calls, 1u, __ATOMIC_RELAXED);
-    __atomic_store_n(&g_last_handle, h, __ATOMIC_RELAXED);
-    __atomic_store_n(&g_last_result, r, __ATOMIC_RELAXED);
-    __atomic_store_n(&g_last_count, count, __ATOMIC_RELAXED);
-    __atomic_store_n(&g_last_connected, (r > 0 && data && count > 0) ? ((uint8_t *)data)[76] : -1, __ATOMIC_RELAXED);
-    if (g_pad.connected && data && count > 0) {
-        if (r <= 0) inject((uint8_t *)data, true);
-        else {
-            int n = r < count ? r : count;
-            for (int i = 0; i < n; ++i) inject((uint8_t *)data + i * sizeof(OrbisPadData), false);
-        }
-        __atomic_fetch_add(&g_inject_calls, 1u, __ATOMIC_RELAXED);
-        return r > 0 ? r : 1;
-    }
+    __atomic_fetch_add(&g_read_calls,1u,__ATOMIC_RELAXED);
+    state_lock();xp::State s=g_mapped;bool ready=g_ready;state_unlock();
+    if(ready && data && r>0 && r<=count) for(int i=0;i<r;i++) {uint8_t *d=(uint8_t*)data+i*sizeof(OrbisPadData);if(d[76]){inject(d,s);__atomic_fetch_add(&g_inject_calls,1u,__ATOMIC_RELAXED);}}
     return r;
 }
 
@@ -817,16 +821,18 @@ static void *hook_thread(void *) {
 
     self_test_pad(h);
     __atomic_store_n(&g_pad_discovery_done, 1, __ATOMIC_RELEASE);
-    if ((orig_ReadState || g_state_trampoline || g_extStateOriginal) && (orig_Read || g_read_trampoline || g_extReadOriginal)) notify("xbox_pad v2.10 diagnostico cargado");
-    else notify("xbox_pad v2.10: hook no disponible");
+    if ((orig_ReadState || g_state_trampoline || g_extStateOriginal) && (orig_Read || g_read_trampoline || g_extReadOriginal)) notify("xbox_pad v2.11 diagnostico cargado");
+    else notify("xbox_pad v2.11: hook no disponible");
     int summaries = 0;
     for (;;) {
         sceKernelSleep(5);
-        if (++summaries == 2 || summaries == 6) log_pad_modules();
+        state_lock(); int ready=g_ready; uint32_t mapped_buttons=g_mapped.buttons; state_unlock();
+        ++summaries;
+        if (!__atomic_load_n(&g_diagnostic,__ATOMIC_RELAXED) && summaries%6) continue;
         logf_("pid=%d juego desde autoprueba: ReadState=%u Read=%u inyecciones=%u USB=%d botones=0x%08X",
               (int)getpid(), __atomic_load_n(&g_readstate_calls, __ATOMIC_RELAXED) - g_gameStateBaseline,
               __atomic_load_n(&g_read_calls, __ATOMIC_RELAXED) - g_gameReadBaseline,
-              __atomic_load_n(&g_inject_calls, __ATOMIC_RELAXED) - g_gameInjectBaseline, g_pad.connected, (unsigned)g_pad.buttons);
+              __atomic_load_n(&g_inject_calls, __ATOMIC_RELAXED) - g_gameInjectBaseline, ready, (unsigned)mapped_buttons);
         logf_("pid=%d pruebas: StateExt=%u ReadExt=%u Info=%u Open=%u GetHandle=%u",
               (int)getpid(), __atomic_load_n(&g_extStateCalls, __ATOMIC_RELAXED) - g_gameExtStateBaseline, __atomic_load_n(&g_extReadCalls, __ATOMIC_RELAXED) - g_gameExtReadBaseline,
               __atomic_load_n(&g_infoCalls, __ATOMIC_RELAXED), __atomic_load_n(&g_openCalls, __ATOMIC_RELAXED), __atomic_load_n(&g_handleCalls, __ATOMIC_RELAXED));
@@ -849,12 +855,14 @@ static int g_started = 0;
 attr_module_hidden int module_start(size_t argc, const void *args) {
     int expected = 0;
     if (!__atomic_compare_exchange_n(&g_started, &expected, 1, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return 0;
-    logf_("xbox_pad v2.10 diagnostico cargado pid=%d", (int)getpid());
+    logf_("xbox_pad v2.11 diagnostico cargado pid=%d", (int)getpid());
     struct proc_info info;
     memset(&info, 0, sizeof(info));
     int r = sys_sdk_proc_info(&info);
     logf_("pid=%d proceso: r=0x%08X titulo=%.16s nombre=%.40s", (int)getpid(), (unsigned)r,
           r == 0 ? info.titleid : "", r == 0 ? info.name : "");
+    if(r != 0 || !xp::titleValid(info.titleid)) return 0;
+    memcpy(g_title,info.titleid,9);g_title[9]=0;
     OrbisPthread t1, t2;
     int hr = scePthreadCreate(&t1, 0, hook_thread, 0, "xbox_hook");
     if (hr != 0) __atomic_store_n(&g_pad_discovery_done, 1, __ATOMIC_RELEASE);
