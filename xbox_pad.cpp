@@ -1,9 +1,10 @@
-// xbox_pad.cpp - Plugin GoldHEN: mando Xbox One/Series (USB, protocolo GIP) -> PS4
-// NOTA: sin probar en consola real.
-// [AJUSTAR] marca lo que puede cambiar segun la version del SDK.
+// xbox_pad.cpp v2 - Xbox One/Series (GIP) por USB -> pad PS4
+// Log en /data/xbox_pad.log. Sin probar en consola real.
 
 #include <stdint.h>
 #include <string.h>
+#include <stdio.h>
+#include <stdarg.h>
 #include <orbis/libkernel.h>
 #include <Common.h>
 #include <GoldHEN.h>
@@ -19,15 +20,14 @@
 attr_public const char *g_pluginName = "xbox_pad";
 attr_public const char *g_pluginDesc = "Xbox One/Series USB controller -> PS4 pad";
 attr_public const char *g_pluginAuth = "community";
-attr_public uint32_t g_pluginVersion = 0x00000100;
+attr_public uint32_t g_pluginVersion = 0x00000200;
+
+// Funciones del SDK/sistema con alias propio (evita choques con cabeceras)
+extern "C" int xp_jailbreak(void *) __asm__("sys_sdk_jailbreak");
+extern "C" int xp_sysmodule(uint32_t) __asm__("sceSysmoduleLoadModule");
 
 #define XBOX_VID 0x045E
-#define EP_IN    0x82
-#define EP_OUT   0x02
-
-static const uint16_t kPids[] = {
-    0x0B12, 0x0B00, 0x02EA, 0x02DD, 0x02D1, 0x02E3
-};
+static const uint16_t kPids[] = {0x0B12, 0x0B00, 0x02EA, 0x02DD, 0x02D1, 0x02E3};
 #define NUM_PIDS (sizeof(kPids) / sizeof(kPids[0]))
 
 #define PS4_L3       0x00000002
@@ -45,58 +45,113 @@ static const uint16_t kPids[] = {
 #define PS4_CIRCLE   0x00002000
 #define PS4_CROSS    0x00004000
 #define PS4_SQUARE   0x00008000
+#define PS4_PS       0x00010000
 #define PS4_TOUCHPAD 0x00100000
 
+// ---------------- Log ----------------
+static int g_loglines = 0;
+static void logf_(const char *fmt, ...) {
+    if (g_loglines > 600) return;
+    g_loglines++;
+    char b[256];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(b, sizeof(b) - 2, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    if (n > 250) n = 250;
+    b[n++] = '\n';
+    int fd = sceKernelOpen("/data/xbox_pad.log", 0x0001 | 0x0008 | 0x0200, 0666);
+    if (fd >= 0) { sceKernelWrite(fd, b, n); sceKernelClose(fd); }
+}
+
+static void log_hex(const char *tag, const uint8_t *p, int n) {
+    char s[200];
+    int k = 0;
+    for (int i = 0; i < n && i < 32 && k < 190; i++)
+        k += snprintf(s + k, sizeof(s) - k, "%02X ", p[i]);
+    logf_("%s %s", tag, s);
+}
+
+// ---------------- Estado compartido ----------------
 struct PadState {
     volatile uint32_t buttons;
     volatile uint8_t lx, ly, rx, ry, l2, r2;
     volatile int connected;
 };
-
 static PadState g_pad = {0, 0x80, 0x80, 0x80, 0x80, 0, 0, 0};
 
-typedef int   (*fn_init)(void **ctx);
-typedef void *(*fn_open_vidpid)(void *ctx, uint16_t vid, uint16_t pid);
-typedef int   (*fn_claim)(void *h, int iface);
-typedef int   (*fn_detach)(void *h, int iface);
-typedef int   (*fn_xfer)(void *h, uint8_t ep, uint8_t *data, int len, int *done, unsigned timeout);
-typedef void  (*fn_close)(void *h);
+// ---------------- libSceUsbd (API tipo libusb-1.0) ----------------
+typedef int (*fn_init)(void **ctx);
+typedef int (*fn_list)(void *ctx, void ***list);
+typedef void (*fn_freelist)(void **list, int unref);
+typedef int (*fn_getdesc)(void *dev, uint8_t *desc);
+typedef int (*fn_open)(void *dev, void **handle);
+typedef void (*fn_close)(void *h);
+typedef int (*fn_iface)(void *h, int iface);
+typedef int (*fn_ctrl)(void *h, uint8_t bm, uint8_t req, uint16_t val, uint16_t idx, uint8_t *data, uint16_t len, unsigned to);
+typedef int (*fn_xfer)(void *h, uint8_t ep, uint8_t *data, int len, int *done, unsigned to);
 
 static fn_init p_init;
-static fn_open_vidpid p_open;
-static fn_claim p_claim;
-static fn_detach p_detach;
-static fn_xfer p_int;
+static fn_list p_list;
+static fn_freelist p_freelist;
+static fn_getdesc p_getdesc;
+static fn_open p_open;
 static fn_close p_close;
+static fn_iface p_claim, p_release, p_kdactive, p_detach;
+static fn_ctrl p_ctrl;
+static fn_xfer p_int;
 
 static bool load_usbd() {
+    int r0 = xp_sysmodule(0xB7);  // modulo USBD
+    logf_("sysmodule USBD = 0x%08X", (unsigned)r0);
     int h = sceKernelLoadStartModule("/system/common/lib/libSceUsbd.sprx", 0, 0, 0, 0, 0);
+    logf_("LoadStartModule libSceUsbd = 0x%08X", (unsigned)h);
     if (h < 0) return false;
     sceKernelDlsym(h, "sceUsbdInit", (void **)&p_init);
-    sceKernelDlsym(h, "sceUsbdOpenDeviceWithVidPid", (void **)&p_open);
+    sceKernelDlsym(h, "sceUsbdGetDeviceList", (void **)&p_list);
+    sceKernelDlsym(h, "sceUsbdFreeDeviceList", (void **)&p_freelist);
+    sceKernelDlsym(h, "sceUsbdGetDeviceDescriptor", (void **)&p_getdesc);
+    sceKernelDlsym(h, "sceUsbdOpen", (void **)&p_open);
+    sceKernelDlsym(h, "sceUsbdClose", (void **)&p_close);
     sceKernelDlsym(h, "sceUsbdClaimInterface", (void **)&p_claim);
+    sceKernelDlsym(h, "sceUsbdReleaseInterface", (void **)&p_release);
+    sceKernelDlsym(h, "sceUsbdKernelDriverActive", (void **)&p_kdactive);
     sceKernelDlsym(h, "sceUsbdDetachKernelDriver", (void **)&p_detach);
+    sceKernelDlsym(h, "sceUsbdControlTransfer", (void **)&p_ctrl);
     sceKernelDlsym(h, "sceUsbdInterruptTransfer", (void **)&p_int);
-    sceKernelDlsym(h, "sceUsbdCloseDevice", (void **)&p_close);
-    return p_init && p_open && p_claim && p_int;
+    logf_("dlsym: init=%d list=%d desc=%d open=%d claim=%d ctrl=%d int=%d",
+          p_init != 0, p_list != 0, p_getdesc != 0, p_open != 0, p_claim != 0, p_ctrl != 0, p_int != 0);
+    return p_init && p_list && p_freelist && p_getdesc && p_open && p_close && p_claim && p_ctrl && p_int;
 }
 
+// timeout en esta consola: 0x80240006 (visto en el log de AJ) o -7 (libusb)
+static bool is_timeout(int r) {
+    return r == -7 || (unsigned)r == 0x80240006u || (unsigned)r == 0x80240007u;
+}
+
+// ---------------- Traduccion GIP -> PS4 ----------------
 static uint8_t axis16(int16_t v)    { return (uint8_t)(((int)v + 32768) >> 8); }
 static uint8_t invaxis16(int16_t v) { return (uint8_t)(255 - (((int)v + 32768) >> 8)); }
 
+static uint32_t s_main = 0, s_guide = 0;
+
 static void parse_gip(const uint8_t *p, int n) {
-    if (n < 18 || p[0] != 0x20) return;
+    if (n >= 5 && p[0] == 0x07) {  // boton Xbox (guia) -> PS
+        s_guide = (p[4] & 1) ? PS4_PS : 0;
+        g_pad.buttons = s_main | s_guide;
+        return;
+    }
+    if (n < 18 || p[0] != 0x20) return;  // 0x20 = informe de entrada
 
     uint8_t b0 = p[4], b1 = p[5];
     uint32_t o = 0;
-
-    if (b0 & 0x04) o |= PS4_OPTIONS;
-    if (b0 & 0x08) o |= PS4_TOUCHPAD;
-    if (b0 & 0x10) o |= PS4_CROSS;
-    if (b0 & 0x20) o |= PS4_CIRCLE;
-    if (b0 & 0x40) o |= PS4_SQUARE;
-    if (b0 & 0x80) o |= PS4_TRIANGLE;
-
+    if (b0 & 0x04) o |= PS4_OPTIONS;   // Menu
+    if (b0 & 0x08) o |= PS4_TOUCHPAD;  // View
+    if (b0 & 0x10) o |= PS4_CROSS;     // A
+    if (b0 & 0x20) o |= PS4_CIRCLE;    // B
+    if (b0 & 0x40) o |= PS4_SQUARE;    // X
+    if (b0 & 0x80) o |= PS4_TRIANGLE;  // Y
     if (b1 & 0x01) o |= PS4_UP;
     if (b1 & 0x02) o |= PS4_DOWN;
     if (b1 & 0x04) o |= PS4_LEFT;
@@ -106,7 +161,7 @@ static void parse_gip(const uint8_t *p, int n) {
     if (b1 & 0x40) o |= PS4_L3;
     if (b1 & 0x80) o |= PS4_R3;
 
-    uint16_t lt = (uint16_t)(p[6] | (p[7] << 8));
+    uint16_t lt = (uint16_t)(p[6] | (p[7] << 8));  // 0..1023
     uint16_t rt = (uint16_t)(p[8] | (p[9] << 8));
     uint8_t l2 = (uint8_t)(lt >> 2), r2 = (uint8_t)(rt >> 2);
     if (l2 > 30) o |= PS4_L2;
@@ -123,48 +178,164 @@ static void parse_gip(const uint8_t *p, int n) {
     g_pad.ry = invaxis16(ry);
     g_pad.l2 = l2;
     g_pad.r2 = r2;
-    g_pad.buttons = o;
+    s_main = o;
+    g_pad.buttons = o | s_guide;
 }
 
+// ---------------- Abrir el mando ----------------
+static uint8_t g_jb[128] __attribute__((aligned(16)));
+static uint8_t g_seq = 0;
+
+static uint32_t g_seen[16];
+static int g_nseen = 0;
+static void note_device(uint16_t vid, uint16_t pid) {
+    uint32_t key = ((uint32_t)vid << 16) | pid;
+    for (int i = 0; i < g_nseen; i++) if (g_seen[i] == key) return;
+    if (g_nseen < 16) g_seen[g_nseen++] = key;
+    logf_("bus: dispositivo %04X:%04X", vid, pid);
+}
+
+static bool find_and_open(void *ctx, void **hOut, int *iface, uint8_t *inEp, uint8_t *outEp) {
+    void **list = 0;
+    int cnt = p_list(ctx, &list);
+    if (cnt <= 0 || !list) return false;
+
+    void *found = 0;
+    for (int i = 0; i < cnt && !found; i++) {
+        uint8_t d[18];
+        memset(d, 0, sizeof(d));
+        if (p_getdesc(list[i], d) != 0) continue;
+        uint16_t vid = (uint16_t)(d[8] | (d[9] << 8));
+        uint16_t pid = (uint16_t)(d[10] | (d[11] << 8));
+        note_device(vid, pid);
+        if (vid != XBOX_VID) continue;
+        for (unsigned k = 0; k < NUM_PIDS; k++)
+            if (kPids[k] == pid) found = list[i];
+    }
+
+    void *h = 0;
+    bool ok = false;
+    if (found) {
+        int r = p_open(found, &h);
+        logf_("sceUsbdOpen = 0x%08X", (unsigned)r);
+        ok = (r == 0 && h);
+    }
+    p_freelist(list, 1);
+    if (!ok) return false;
+
+    // Descriptor de configuracion: buscar interfaz FF/47/D0 y sus endpoints
+    *iface = 0; *inEp = 0x82; *outEp = 0x02;  // valores vistos en tu mando
+    uint8_t cfg[256];
+    memset(cfg, 0, sizeof(cfg));
+    int len = p_ctrl(h, 0x80, 6, 0x0200, 0, cfg, 255, 1000);
+    logf_("config descriptor: %d bytes", len);
+    if (len > 9) {
+        uint8_t fi = 0xFF, fin = 0, fout = 0;
+        bool match = false;
+        int off = 0;
+        while (off + 2 <= len) {
+            uint8_t dl = cfg[off], dt = cfg[off + 1];
+            if (dl < 2) break;
+            if (dt == 4 && dl >= 9) {
+                match = (cfg[off + 3] == 0 && cfg[off + 5] == 0xFF && cfg[off + 6] == 0x47 && cfg[off + 7] == 0xD0);
+                if (match && fi == 0xFF) fi = cfg[off + 2];
+            } else if (dt == 5 && match && dl >= 7 && (cfg[off + 3] & 3) == 3) {
+                if (cfg[off + 2] & 0x80) { if (!fin) fin = cfg[off + 2]; }
+                else { if (!fout) fout = cfg[off + 2]; }
+            }
+            off += dl;
+        }
+        if (fi != 0xFF && fin && fout) { *iface = fi; *inEp = fin; *outEp = fout; }
+        logf_("GIP: iface=%d IN=0x%02X OUT=0x%02X", *iface, *inEp, *outEp);
+    }
+    *hOut = h;
+    return true;
+}
+
+static bool send_power_on(void *h, uint8_t ep) {
+    uint8_t pk[5] = {0x05, 0x20, g_seq++, 0x01, 0x00};
+    int done = 0;
+    int r = p_int(h, ep, pk, 5, &done, 1000);
+    logf_("power-on -> r=0x%08X enviados=%d", (unsigned)r, done);
+    return r == 0;
+}
+
+// ---------------- Hilo USB ----------------
 static void *usb_thread(void *) {
-    if (!load_usbd()) return 0;
+    sceKernelSleep(3);
+    logf_("usb_thread: inicio");
+    int jr = xp_jailbreak(g_jb);
+    logf_("jailbreak = %d", jr);
+    if (!load_usbd()) { logf_("libSceUsbd no disponible: me rindo"); return 0; }
     void *ctx = 0;
-    p_init(&ctx);
+    int ir = p_init(&ctx);
+    logf_("sceUsbdInit = 0x%08X", (unsigned)ir);
 
+    int scans = 0;
     for (;;) {
-        void *dev = 0;
-        for (unsigned i = 0; i < NUM_PIDS && !dev; i++)
-            dev = p_open(ctx, XBOX_VID, kPids[i]);
-
-        if (!dev) { sceKernelUsleep(1000 * 1000); continue; }
-
-        if (p_detach) p_detach(dev, 0);
-        if (p_claim(dev, 0) != 0) {
-            if (p_close) p_close(dev);
+        void *h = 0;
+        int iface = 0;
+        uint8_t inEp = 0, outEp = 0;
+        if (!find_and_open(ctx, &h, &iface, &inEp, &outEp)) {
+            if (++scans == 1 || scans % 30 == 0) logf_("sin mando Xbox en el bus (intento %d)", scans);
             sceKernelUsleep(1000 * 1000);
             continue;
         }
+        scans = 0;
 
-        uint8_t init[5] = {0x05, 0x20, 0x00, 0x01, 0x00};
-        int done = 0;
-        p_int(dev, EP_OUT, init, 5, &done, 1000);
-        g_pad.connected = 1;
-
-        for (;;) {
-            uint8_t buf[64];
-            done = 0;
-            int r = p_int(dev, EP_IN, buf, sizeof(buf), &done, 200);
-            if (r == 0 && done > 0) parse_gip(buf, done);
-            else if (r != 0 && r != -7) break;
+        if (p_kdactive && p_detach && p_kdactive(h, iface) == 1) {
+            int dr = p_detach(h, iface);
+            logf_("detach kernel driver = 0x%08X", (unsigned)dr);
+        }
+        int cr = p_claim(h, iface);
+        logf_("claim iface %d = 0x%08X", iface, (unsigned)cr);
+        if (cr != 0) {
+            p_close(h);
+            sceKernelUsleep(2000 * 1000);
+            continue;
         }
 
+        g_seq = 0;
+        send_power_on(h, outEp);
+        g_pad.connected = 1;
+
+        int errs = 0, npk = 0, poweron_extra = 0;
+        uint8_t lastcmd = 0xFF;
+        for (;;) {
+            uint8_t buf[64];
+            int done = 0;
+            int r = p_int(h, inEp, buf, sizeof(buf), &done, 100);
+            if (r == 0 && done > 0) {
+                errs = 0;
+                if (npk < 12 || buf[0] != lastcmd) { log_hex("rx", buf, done); }
+                npk++;
+                lastcmd = buf[0];
+                if (buf[0] == 0x02 && poweron_extra < 3) {  // anuncio: repetir encendido
+                    poweron_extra++;
+                    send_power_on(h, outEp);
+                }
+                parse_gip(buf, done);
+            } else if (is_timeout(r)) {
+                errs = 0;
+            } else {
+                if (++errs == 1) logf_("lectura r=0x%08X", (unsigned)r);
+                if (errs > 20) break;
+                sceKernelUsleep(5 * 1000);
+            }
+        }
+
+        logf_("mando desconectado o con error; reintento");
         g_pad.connected = 0;
         g_pad.buttons = 0;
-        if (p_close) p_close(dev);
+        s_main = s_guide = 0;
+        if (p_release) p_release(h, iface);
+        p_close(h);
+        sceKernelUsleep(1000 * 1000);
     }
     return 0;
 }
 
+// ---------------- Hooks de scePad ----------------
 typedef int (*fn_ReadState)(int32_t, void *);
 typedef int (*fn_Read)(int32_t, void *, int32_t);
 
@@ -189,12 +360,14 @@ static void inject(uint8_t *d, bool fresh) {
 }
 
 static int hook_ReadState(int32_t h, void *data) {
+    if (!orig_ReadState) return -1;
     int r = orig_ReadState(h, data);
     if (g_pad.connected && data) { inject((uint8_t *)data, r != 0); return 0; }
     return r;
 }
 
 static int hook_Read(int32_t h, void *data, int32_t count) {
+    if (!orig_Read) return -1;
     int r = orig_Read(h, data, count);
     if (g_pad.connected && data && count > 0) { inject((uint8_t *)data, r <= 0); return r > 0 ? r : 1; }
     return r;
@@ -203,23 +376,26 @@ static int hook_Read(int32_t h, void *data, int32_t count) {
 static void *hook_thread(void *) {
     sceKernelSleep(5);
     int h = sceKernelLoadStartModule("/system/common/lib/libScePad.sprx", 0, 0, 0, 0, 0);
+    logf_("libScePad = 0x%08X", (unsigned)h);
     if (h < 0) return 0;
 
     void *a1 = 0, *a2 = 0;
     sceKernelDlsym(h, "scePadReadState", &a1);
     sceKernelDlsym(h, "scePadRead", &a2);
+    logf_("scePadReadState=%p scePadRead=%p", a1, a2);
 
-    // [AJUSTAR] API de Detour del SDK (funciones C)
     Detour_Construct(&g_dReadState, (DetourMode)0);
     Detour_Construct(&g_dRead, (DetourMode)0);
     if (a1) orig_ReadState = (fn_ReadState)Detour_DetourFunction(&g_dReadState, (uint64_t)a1, (void *)hook_ReadState);
     if (a2) orig_Read      = (fn_Read)Detour_DetourFunction(&g_dRead, (uint64_t)a2, (void *)hook_Read);
+    logf_("hooks: orig_ReadState=%p orig_Read=%p", (void *)orig_ReadState, (void *)orig_Read);
     return 0;
 }
 
 extern "C" {
 
 attr_module_hidden int module_start(size_t argc, const void *args) {
+    logf_("xbox_pad v2 cargado");
     OrbisPthread t1, t2;
     scePthreadCreate(&t1, 0, hook_thread, 0, "xbox_hook");
     scePthreadCreate(&t2, 0, usb_thread, 0, "xbox_usb");
