@@ -1,4 +1,4 @@
-// xbox_pad.cpp v2.2 - Xbox One/Series (GIP) por USB -> pad PS4
+// xbox_pad.cpp v2.3 - Xbox One/Series (GIP) por USB -> pad PS4
 // Log en /data/xbox_pad.log + avisos en pantalla. Sin probar en consola real.
 
 #include <stdint.h>
@@ -20,12 +20,13 @@
 attr_public const char *g_pluginName = "xbox_pad";
 attr_public const char *g_pluginDesc = "Xbox One/Series USB controller -> PS4 pad";
 attr_public const char *g_pluginAuth = "community";
-attr_public uint32_t g_pluginVersion = 0x00000202;
+attr_public uint32_t g_pluginVersion = 0x00000203;
 
 // Funciones del SDK/sistema con alias propio (evita choques con cabeceras)
 extern "C" int xp_jailbreak(void *) __asm__("sys_sdk_jailbreak");
 extern "C" int xp_sysmodule(uint32_t) __asm__("sceSysmoduleLoadModule");
 extern "C" int xp_notify_raw(int, void *, size_t, int) __asm__("sceKernelSendNotificationRequest");
+extern "C" uint64_t xp_ptime(void) __asm__("sceKernelGetProcessTime");
 
 #define XBOX_VID 0x045E
 static const uint16_t kPids[] = {0x0B12, 0x0B00, 0x02EA, 0x02DD, 0x02D1, 0x02E3};
@@ -52,7 +53,7 @@ static const uint16_t kPids[] = {0x0B12, 0x0B00, 0x02EA, 0x02DD, 0x02D1, 0x02E3}
 // ---------------- Log ----------------
 static int g_loglines = 0;
 static void logf_(const char *fmt, ...) {
-    if (g_loglines > 600) return;
+    if (g_loglines > 1200) return;
     g_loglines++;
     char b[256];
     va_list ap;
@@ -216,6 +217,8 @@ static void parse_gip(const uint8_t *p, int n) {
 
 // ---------------- Abrir el mando ----------------
 static uint8_t g_jb[128] __attribute__((aligned(16)));
+static uint8_t g_rx[64] __attribute__((aligned(64)));
+static uint8_t g_tx[64] __attribute__((aligned(64)));
 static uint8_t g_seq = 0;
 
 static uint32_t g_seen[16];
@@ -288,9 +291,9 @@ static bool find_and_open(void *ctx, void **hOut, int *iface, uint8_t *inEp, uin
 }
 
 static bool send_power_on(void *h, uint8_t ep) {
-    uint8_t pk[5] = {0x05, 0x20, g_seq++, 0x01, 0x00};
+    g_tx[0] = 0x05; g_tx[1] = 0x20; g_tx[2] = g_seq++; g_tx[3] = 0x01; g_tx[4] = 0x00;
     int done = 0;
-    int r = p_int(h, ep, pk, 5, &done, 1000);
+    int r = p_int(h, ep, g_tx, 5, &done, 1000);
     logf_("power-on -> r=0x%08X enviados=%d", (unsigned)r, done);
     return r == 0;
 }
@@ -335,28 +338,55 @@ static void *usb_thread(void *) {
         g_pad.connected = 1;
         notify("Mando Xbox conectado (xbox_pad)");
 
-        int errs = 0, npk = 0, poweron_extra = 0;
+        int errs = 0, npk = 0, poweron_extra = 0, resends = 0;
+        int nreads = 0, ntimeouts = 0, nerrtotal = 0;
         uint8_t lastcmd = 0xFF;
+        uint64_t t_start = xp_ptime();
+        uint64_t t_status = t_start, t_poweron = t_start;
+
         for (;;) {
-            uint8_t buf[64];
             int done = 0;
-            int r = p_int(h, inEp, buf, sizeof(buf), &done, 100);
+            bool dbg = nreads < 25;
+            if (dbg) logf_("leyendo #%d ...", nreads);
+            uint64_t t0 = xp_ptime();
+            int r = p_int(h, inEp, g_rx, 64, &done, 100);
+            uint64_t t1 = xp_ptime();
+            if (dbg) logf_("   r=0x%08X done=%d tardo=%u ms", (unsigned)r, done, (unsigned)((t1 - t0) / 1000));
+            nreads++;
+
             if (r == 0 && done > 0) {
                 errs = 0;
-                if (npk < 12 || buf[0] != lastcmd) { log_hex("rx", buf, done); }
+                if (npk < 12 || g_rx[0] != lastcmd) { log_hex("rx", g_rx, done); }
                 npk++;
-                lastcmd = buf[0];
-                if (buf[0] == 0x02 && poweron_extra < 3) {  // anuncio: repetir encendido
+                lastcmd = g_rx[0];
+                if (g_rx[0] == 0x02 && poweron_extra < 3) {  // anuncio: repetir encendido
                     poweron_extra++;
                     send_power_on(h, outEp);
                 }
-                parse_gip(buf, done);
+                parse_gip(g_rx, done);
             } else if (is_timeout(r)) {
                 errs = 0;
+                ntimeouts++;
             } else {
-                if (++errs == 1) logf_("lectura r=0x%08X", (unsigned)r);
+                nerrtotal++;
+                if (++errs == 1 && nerrtotal < 10) logf_("lectura r=0x%08X", (unsigned)r);
                 if (errs > 20) break;
                 sceKernelUsleep(5 * 1000);
+            }
+
+            // Reenviar el encendido cada 2 s mientras no llegue ningun paquete
+            if (npk == 0 && resends < 6 && (t1 - t_poweron) > 2000000ULL) {
+                t_poweron = t1;
+                resends++;
+                logf_("sin paquetes aun: reenvio encendido (%d)", resends);
+                send_power_on(h, outEp);
+            }
+
+            // Resumen cada 5 s
+            if ((t1 - t_status) > 5000000ULL) {
+                t_status = t1;
+                logf_("estado: t=%us lecturas=%d timeouts=%d errores=%d paquetes=%d",
+                      (unsigned)((t1 - t_start) / 1000000ULL), nreads, ntimeouts, nerrtotal, npk);
             }
         }
 
@@ -406,42 +436,4 @@ static int hook_ReadState(int32_t h, void *data) {
 static int hook_Read(int32_t h, void *data, int32_t count) {
     if (!orig_Read) return -1;
     int r = orig_Read(h, data, count);
-    if (g_pad.connected && data && count > 0) { inject((uint8_t *)data, r <= 0); return r > 0 ? r : 1; }
-    return r;
-}
-
-static void *hook_thread(void *) {
-    sceKernelSleep(5);
-    int h = sceKernelLoadStartModule("/system/common/lib/libScePad.sprx", 0, 0, 0, 0, 0);
-    logf_("libScePad = 0x%08X", (unsigned)h);
-    if (h < 0) { notify("xbox_pad: no se pudo cargar libScePad"); return 0; }
-
-    void *a1 = 0, *a2 = 0;
-    sceKernelDlsym(h, "scePadReadState", &a1);
-    sceKernelDlsym(h, "scePadRead", &a2);
-    logf_("scePadReadState=%p scePadRead=%p", a1, a2);
-
-    Detour_Construct(&g_dReadState, (DetourMode)0);
-    Detour_Construct(&g_dRead, (DetourMode)0);
-    if (a1) orig_ReadState = (fn_ReadState)Detour_DetourFunction(&g_dReadState, (uint64_t)a1, (void *)hook_ReadState);
-    if (a2) orig_Read      = (fn_Read)Detour_DetourFunction(&g_dRead, (uint64_t)a2, (void *)hook_Read);
-    logf_("hooks: orig_ReadState=%p orig_Read=%p", (void *)orig_ReadState, (void *)orig_Read);
-
-    if (orig_ReadState && orig_Read) notify("xbox_pad v2.2 cargado");
-    else notify("xbox_pad v2.2: fallaron los hooks");
-    return 0;
-}
-
-extern "C" {
-
-attr_module_hidden int module_start(size_t argc, const void *args) {
-    logf_("xbox_pad v2.2 cargado");
-    OrbisPthread t1, t2;
-    scePthreadCreate(&t1, 0, hook_thread, 0, "xbox_hook");
-    scePthreadCreate(&t2, 0, usb_thread, 0, "xbox_usb");
-    return 0;
-}
-
-attr_module_hidden int module_stop(size_t argc, const void *args) { return 0; }
-
-}
+    if (g_pad.connected && data && count > 0) { inject((uint8_t *)data, r
