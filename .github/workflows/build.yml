@@ -27,11 +27,16 @@ jobs:
 
       - name: Compilar
         run: |
-          D=$(find sdk -type f -name Makefile | grep -iE 'sample|example|template' | head -n1 | xargs dirname)
-          echo "Carpeta del ejemplo: $D"
+          MAKEFILE_PATH=$(find sdk -type f -name Makefile | head -n1)
+          if [ -z "$MAKEFILE_PATH" ]; then
+            echo "Error: No se encontró ningún Makefile en el SDK."
+            exit 1
+          fi
+          D=$(dirname "$MAKEFILE_PATH")
+          echo "Carpeta del Makefile encontrada: $D"
           cp xbox_pad.cpp "$D"/
           cd "$D"
-          ls
+          ls -la
           export GOLDHEN_SDK=$GITHUB_WORKSPACE/sdk
           make
 
