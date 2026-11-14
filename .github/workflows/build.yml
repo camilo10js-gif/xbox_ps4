@@ -36,8 +36,8 @@ jobs:
         run: |
           cp xbox_pad.cpp sdk/source/
           cd sdk
-          make clean crt
-          make TARGET=xbox_pad.prx xbox_pad.prx
+          make TARGETCRT=crtprx.o clean crt
+          make TARGETCRT=crtprx.o TARGET=xbox_pad.prx xbox_pad.prx
 
       - name: Recoger resultado
         if: always()
