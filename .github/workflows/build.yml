@@ -1,54 +1,32 @@
-name: Build xbox_pad
-
-on:
-  push:
-  workflow_dispatch:
-
+name: Build XboxPad plugin and configurator
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
 jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-
-      - name: Dependencias
+      - name: Dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang lld llvm g++ make git curl python3
+      - name: Pinned toolchain
+        run: bash scripts/setup.sh "$RUNNER_TEMP/xbox-toolchain"
+      - name: Configure environment
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential clang lld llvm git make jq curl
-
-      - name: OpenOrbis (release precompilado)
+          echo "OO_PS4_TOOLCHAIN=$RUNNER_TEMP/xbox-toolchain/oo/OpenOrbis/PS4Toolchain" >> "$GITHUB_ENV"
+          echo "GOLDHEN_SDK=$RUNNER_TEMP/xbox-toolchain/sdk" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/xbox-toolchain/compat/usr/lib/x86_64-linux-gnu" >> "$GITHUB_ENV"
+      - name: Tests
+        run: bash scripts/test.sh
+      - name: Build and validate PRX and PKG
         run: |
-          URL=$(curl -s https://api.github.com/repos/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/latest | jq -r '.assets[].browser_download_url' | grep -i 'tar.gz' | head -1)
-          echo "Descargando: $URL"
-          mkdir -p oo
-          curl -sL "$URL" -o oo.tar.gz
-          tar -xzf oo.tar.gz -C oo
-          BINDIR=$(find oo -type d -path '*/bin/linux' | head -1)
-          ROOT=$(dirname "$(dirname "$BINDIR")")
-          chmod +x "$BINDIR"/* || true
-          echo "Toolchain en: $ROOT"
-          ls "$ROOT"
-          echo "OO_PS4_TOOLCHAIN=$GITHUB_WORKSPACE/$ROOT" >> $GITHUB_ENV
-
-      - name: SDK GoldHEN
-        run: git clone --depth 1 https://github.com/GoldHEN/GoldHEN_Plugins_SDK sdk
-
-      - name: Compilar
-        run: |
-          cp xbox_pad.cpp sdk/source/
-          cd sdk
-          make TARGETCRT=crtprx.o clean crt
-          make TARGETCRT=crtprx.o TARGET=xbox_pad.prx xbox_pad.prx
-
-      - name: Recoger resultado
-        if: always()
-        run: |
-          mkdir -p out
-          find sdk -name '*.prx' -exec cp {} out/ \;
-          ls out
-
+          bash scripts/build.sh
+          python3 scripts/check_exports.py build/sdk/build/source.oelf
       - uses: actions/upload-artifact@v4
-        if: always()
         with:
-          name: xbox_pad
-          path: out/
-          if-no-files-found: warn
+          name: XboxPad-2.11-Configurator-1.0
+          if-no-files-found: error
+          path: |
+            build/sdk/xbox_pad.prx
+            build/*.pkg
+            build/SHA256SUMS
