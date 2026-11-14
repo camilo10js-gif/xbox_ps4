@@ -39,10 +39,8 @@ jobs:
           ls -la
           export GOLDHEN_SDK=$GITHUB_WORKSPACE/sdk
           export OO_PS4_TOOLCHAIN=$GITHUB_WORKSPACE/oo
-          # Forzar la ruta de los includes de OpenOrbis para que encuentre errno.h
-          export CFLAGS="-I$OO_PS4_TOOLCHAIN/include -I$OO_PS4_TOOLCHAIN/sysroot/usr/include"
-          export CXXFLAGS="$CFLAGS"
-          make
+          export PATH="$OO_PS4_TOOLCHAIN/bin:$PATH"
+          make OO_PS4_TOOLCHAIN=$OO_PS4_TOOLCHAIN
 
       - name: Recoger resultado
         if: always()
@@ -57,3 +55,4 @@ jobs:
           name: xbox_pad
           path: out/
           if-no-files-found: warn
+        
