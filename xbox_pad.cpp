@@ -1,5 +1,5 @@
-// xbox_pad.cpp v2.1 - Xbox One/Series (GIP) por USB -> pad PS4
-// Log en /data/xbox_pad.log. Sin probar en consola real.
+// xbox_pad.cpp v2.2 - Xbox One/Series (GIP) por USB -> pad PS4
+// Log en /data/xbox_pad.log + avisos en pantalla. Sin probar en consola real.
 
 #include <stdint.h>
 #include <string.h>
@@ -20,11 +20,12 @@
 attr_public const char *g_pluginName = "xbox_pad";
 attr_public const char *g_pluginDesc = "Xbox One/Series USB controller -> PS4 pad";
 attr_public const char *g_pluginAuth = "community";
-attr_public uint32_t g_pluginVersion = 0x00000201;
+attr_public uint32_t g_pluginVersion = 0x00000202;
 
 // Funciones del SDK/sistema con alias propio (evita choques con cabeceras)
 extern "C" int xp_jailbreak(void *) __asm__("sys_sdk_jailbreak");
 extern "C" int xp_sysmodule(uint32_t) __asm__("sceSysmoduleLoadModule");
+extern "C" int xp_notify_raw(int, void *, size_t, int) __asm__("sceKernelSendNotificationRequest");
 
 #define XBOX_VID 0x045E
 static const uint16_t kPids[] = {0x0B12, 0x0B00, 0x02EA, 0x02DD, 0x02D1, 0x02E3};
@@ -71,6 +72,36 @@ static void log_hex(const char *tag, const uint8_t *p, int n) {
     for (int i = 0; i < n && i < 32 && k < 190; i++)
         k += snprintf(s + k, sizeof(s) - k, "%02X ", p[i]);
     logf_("%s %s", tag, s);
+}
+
+// ---------------- Aviso en pantalla ----------------
+struct XpNotif {
+    int type;
+    int reqId;
+    int priority;
+    int msgId;
+    int targetId;
+    int userId;
+    int unk1;
+    int unk2;
+    int appId;
+    int errorNum;
+    int unk3;
+    unsigned char useIconImageUri;
+    char message[1024];
+    char iconImageUri[1024];
+};
+
+static void notify(const char *msg) {
+    XpNotif n;
+    memset(&n, 0, sizeof(n));
+    n.type = 0;
+    n.unk3 = 0;
+    n.useIconImageUri = 1;
+    snprintf(n.message, sizeof(n.message), "%s", msg);
+    snprintf(n.iconImageUri, sizeof(n.iconImageUri), "cxml://psnotification/tex_icon_system");
+    int r = xp_notify_raw(0, &n, sizeof(n), 0);
+    logf_("aviso '%s' -> 0x%08X", msg, (unsigned)r);
 }
 
 // ---------------- Estado compartido ----------------
@@ -302,6 +333,7 @@ static void *usb_thread(void *) {
         g_seq = 0;
         send_power_on(h, outEp);
         g_pad.connected = 1;
+        notify("Mando Xbox conectado (xbox_pad)");
 
         int errs = 0, npk = 0, poweron_extra = 0;
         uint8_t lastcmd = 0xFF;
@@ -329,6 +361,7 @@ static void *usb_thread(void *) {
         }
 
         logf_("mando desconectado o con error; reintento");
+        notify("Mando Xbox desconectado (xbox_pad)");
         g_pad.connected = 0;
         g_pad.buttons = 0;
         s_main = s_guide = 0;
@@ -381,7 +414,7 @@ static void *hook_thread(void *) {
     sceKernelSleep(5);
     int h = sceKernelLoadStartModule("/system/common/lib/libScePad.sprx", 0, 0, 0, 0, 0);
     logf_("libScePad = 0x%08X", (unsigned)h);
-    if (h < 0) return 0;
+    if (h < 0) { notify("xbox_pad: no se pudo cargar libScePad"); return 0; }
 
     void *a1 = 0, *a2 = 0;
     sceKernelDlsym(h, "scePadReadState", &a1);
@@ -393,13 +426,16 @@ static void *hook_thread(void *) {
     if (a1) orig_ReadState = (fn_ReadState)Detour_DetourFunction(&g_dReadState, (uint64_t)a1, (void *)hook_ReadState);
     if (a2) orig_Read      = (fn_Read)Detour_DetourFunction(&g_dRead, (uint64_t)a2, (void *)hook_Read);
     logf_("hooks: orig_ReadState=%p orig_Read=%p", (void *)orig_ReadState, (void *)orig_Read);
+
+    if (orig_ReadState && orig_Read) notify("xbox_pad v2.2 cargado");
+    else notify("xbox_pad v2.2: fallaron los hooks");
     return 0;
 }
 
 extern "C" {
 
 attr_module_hidden int module_start(size_t argc, const void *args) {
-    logf_("xbox_pad v2.1 cargado");
+    logf_("xbox_pad v2.2 cargado");
     OrbisPthread t1, t2;
     scePthreadCreate(&t1, 0, hook_thread, 0, "xbox_hook");
     scePthreadCreate(&t2, 0, usb_thread, 0, "xbox_usb");
