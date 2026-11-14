@@ -38,6 +38,10 @@ jobs:
           cd "$D"
           ls -la
           export GOLDHEN_SDK=$GITHUB_WORKSPACE/sdk
+          export OO_PS4_TOOLCHAIN=$GITHUB_WORKSPACE/oo
+          # Forzar la ruta de los includes de OpenOrbis para que encuentre errno.h
+          export CFLAGS="-I$OO_PS4_TOOLCHAIN/include -I$OO_PS4_TOOLCHAIN/sysroot/usr/include"
+          export CXXFLAGS="$CFLAGS"
           make
 
       - name: Recoger resultado
