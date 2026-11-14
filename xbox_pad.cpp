@@ -210,8 +210,8 @@ static void *hook_thread(void *) {
     sceKernelDlsym(h, "scePadRead", &a2);
 
     // [AJUSTAR] API de Detour del SDK (funciones C)
-    Detour_Construct(&g_dReadState, false);
-    Detour_Construct(&g_dRead, false);
+    Detour_Construct(&g_dReadState, (DetourMode)0);
+    Detour_Construct(&g_dRead, (DetourMode)0);
     if (a1) orig_ReadState = (fn_ReadState)Detour_DetourFunction(&g_dReadState, (uint64_t)a1, (void *)hook_ReadState);
     if (a2) orig_Read      = (fn_Read)Detour_DetourFunction(&g_dRead, (uint64_t)a2, (void *)hook_Read);
     return 0;
